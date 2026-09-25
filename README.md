@@ -106,12 +106,25 @@ Windows PowerShell 示例：
 
 ## 验证
 
+CI 的质量检查使用滚动更新的 Rust stable；本地 `stable` 名称不代表工具链已更新。
+验证前先更新 stable，并检查默认及全部 features；仅在最低支持版本上通过 lint 不足以复现 CI。
+
 ```sh
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+rustup update stable
+rustup component add --toolchain stable rustfmt clippy
+cargo +stable fmt --all -- --check
+cargo +stable clippy --locked --all-targets -- -D warnings
+cargo +stable clippy --locked --all-targets --all-features -- -D warnings
+cargo +stable test --locked
 bash scripts/check-dependencies.sh
-cargo build --release --locked
+cargo +stable build --release --locked
+```
+
+最低支持版本单独验证，不替代上述 stable 检查：
+
+```sh
+rustup toolchain install 1.89.0 --profile minimal
+cargo +1.89.0 test --locked
 ```
 
 普通测试使用公开 RFC 测试密钥及内存凭据库，涵盖 RFC 6238 全部 18 个向量、严格解析、实际二维码、

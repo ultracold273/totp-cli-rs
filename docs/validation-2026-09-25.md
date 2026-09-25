@@ -1,7 +1,7 @@
 # Rust 移植验证记录
 
-日期：2026-09-25。执行环境：macOS Apple Silicon，Rust 1.89.0。
-本记录仅描述已经执行的本机命令；不把配置好的 CI、交叉检查或模拟凭据测试算作其他平台的原生验收。
+日期：2026-09-25。首轮本机验收环境：macOS Apple Silicon，Rust 1.89.0。
+本记录区分本机结果、交叉检查和远程 CI 结果；不把配置好的 CI、交叉检查或模拟凭据测试算作其他平台的原生验收。
 
 ## 本机验证
 
@@ -54,7 +54,7 @@ C/C++ 构建工具及 OpenSSL、libdbus、第三方原生二维码/图像库；�
 [CI 工作流](../.github/workflows/ci.yml)包含 Windows x64、macOS ARM/Intel 和 Linux x64 原生 runner：
 普通测试、默认和测试 feature 的 lint、隔离原生凭据测试、release 链接及冒烟测试。
 Windows 测试读取实际凭据的本机持久化标记；macOS 使用临时钥匙串；Linux 使用独立 D-Bus / Secret Service。
-CI YAML 已做本机语法解析，但没有远程运行结果；Windows/Linux 的凭据服务行为仍须这些测试实际执行后确认。
+首次远程执行卡在 Clippy，尚未执行这些原生测试，排查见下文；Windows/Linux 的凭据服务行为仍须这些测试实际执行后确认。
 
 ## 审查修复
 
@@ -65,3 +65,43 @@ CI YAML 已做本机语法解析，但没有远程运行结果；Windows/Linux �
 
 上述本机验收完成时，原 Python 仓库未修改；Rust 仓库尚未提交，也未创建远程或推送。
 后续公开仓库及推送授权另见[设计记录](superpowers/specs/2026-09-25-rust-port-design.md)。
+
+## 首次 GitHub CI 失败排查
+
+同日检查 `ultracold273/totp-cli-rs` 的 run `36094930886`，对应提交 `dbaa70e`：
+Rust 1.89.0 的 MSRV job 成功，四个系统矩阵 job 均在第一个 Clippy 步骤失败，未运行到原生凭据测试。
+CI 的 rolling stable 实际为 `rustc 1.98.1 (48a229cea 2026-09-01)`，而本机原有 `stable` 仍为 1.89.0。
+本机安装独立的 1.98.1 工具链后，用以下命令复现相同的三个 lint 错误，退出码为 101：
+
+```sh
+cargo +1.98.1 clippy --locked --all-targets -- -D warnings
+```
+
+| 位置 | 错误 | 修复 |
+| --- | --- | --- |
+| `src/vault/windows.rs` | `manual_is_multiple_of`、`chunks_exact_to_as_chunks` | 使用 `as_chunks::<2>()`，通过 remainder 拒绝奇数字节；保留长度上限和 UTF-16 校验 |
+| `tests/native.rs` | `assertions_on_constants` | 断言实际凭据 service 前缀为测试命名空间，在构造原生 fixture 之前拒绝生产构建 |
+
+Windows 编码辅助模块也在其他平台的单元测试中编译，因此它的 lint 会阻塞全部矩阵目标。
+修复未修改凭据后端、依赖或 CI 检查强度，没有关闭 `-D warnings` 或固定旧 stable 来绕过检查。
+[README](../README.md) 增加了更新 stable、检查两种 feature 配置和单独验证 MSRV 的步骤。
+
+修复后的本机复测（仍为 macOS Apple Silicon）：
+
+| 检查 | 结果 |
+| --- | --- |
+| Rust 1.98.1 和 1.89.0 的 `cargo fmt --all -- --check` | 均通过 |
+| Rust 1.98.1 四目标的 `cargo clippy --locked --all-targets`，分别使用默认 features 和 `--all-features`，均带 `-- -D warnings` | 全部通过；ARM macOS 为本机检查，Windows x64、Linux x64、Intel macOS 为交叉检查 |
+| Rust 1.89.0 本机 Clippy，默认及全部 features，均带 `-- -D warnings` | 均通过 |
+| `cargo +1.98.1 test --locked --lib vault::windows::tests` | 5 项通过，覆盖编码兼容、UTF-16 字节长度及损坏 blob；这些测试也包含在完整测试中 |
+| Rust 1.98.1 和 1.89.0 的 `cargo test --locked` | 各 86 项通过，2 项原生测试默认忽略，无失败 |
+| `cargo +1.98.1 test --locked --features native-test --lib --test cli --test store` | 42 项通过，与完整普通测试有重叠 |
+| `cargo +1.98.1 test --locked --test native -- --ignored --test-threads=1` | 按预期退出 101，在命名空间断言处拒绝，未构造或访问原生凭据 fixture |
+| `cargo +1.98.1 test --locked --features native-test --test native --test native_cli -- --ignored --test-threads=1` | 2 项通过，使用真实 macOS Keychain、随机测试凭据和测试命名空间；未设置 `TOTP_TEST_BINARY` 覆盖 |
+| `cargo +1.98.1 build --locked`，随后执行 `target/debug/totp --version` | 通过，恢复默认 debug 二进制为 `totp 0.1.0`，不含测试命名空间标记 |
+
+此处的 1.89.0 复测使用本机尚未更新的 `+stable` 别名，执行前已确认 `rustc +stable --version` 为 1.89.0；
+1.98.1 的命令均显式使用 `+1.98.1`。后续重现应使用实际版本，不能假定本地 `stable` 别名指向 CI 的版本。
+
+以上结果记录于修复提交、推送和远程重跑之前，不代表 Windows/Linux/Intel macOS 原生测试、
+各平台 release 链接或完整 GitHub Actions 工作流已经通过；这些须由推送修复后的 CI 另行确认。

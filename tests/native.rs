@@ -11,8 +11,9 @@ struct DisposableCredential {
 
 impl DisposableCredential {
     fn new() -> Self {
-        assert!(
-            cfg!(feature = "native-test"),
+        assert_eq!(
+            totp_cli::vault::SERVICE_PREFIX,
+            "local-totp-cli-rs-native-test",
             "Native tests require --features native-test to isolate OS credentials."
         );
         Self {

@@ -28,12 +28,11 @@ fn encode_secret(secret: &str) -> Result<Zeroizing<Vec<u8>>> {
 }
 
 fn decode_secret(blob: &[u8]) -> Result<String> {
-    if blob.len() > MAX_CREDENTIAL_BYTES || blob.len() % 2 != 0 {
+    let (byte_pairs, remainder) = blob.as_chunks::<2>();
+    if blob.len() > MAX_CREDENTIAL_BYTES || !remainder.is_empty() {
         return Err(invalid_credential());
     }
-    let units = blob
-        .chunks_exact(2)
-        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+    let units = byte_pairs.iter().map(|bytes| u16::from_le_bytes(*bytes));
     let mut decoded = Zeroizing::new(String::with_capacity(blob.len() / 2 * 3));
     for character in char::decode_utf16(units) {
         decoded.push(character.map_err(|_| invalid_credential())?);
