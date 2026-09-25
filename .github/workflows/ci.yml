@@ -1,0 +1,94 @@
+name: Rust
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: totp.exe
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: totp
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: totp
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: totp
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+      - run: cargo clippy --locked --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+      - run: cargo test --locked --target ${{ matrix.target }}
+      - run: cargo test --locked --features native-test --target ${{ matrix.target }} --lib --test cli --test store
+      - run: bash scripts/check-dependencies.sh ${{ matrix.target }}
+      - name: Windows disposable native credentials
+        if: runner.os == 'Windows'
+        run: cargo test --locked --features native-test --target ${{ matrix.target }} --test native --test native_cli -- --ignored --test-threads=1
+      - name: macOS isolated test keychain
+        if: runner.os == 'macOS'
+        run: |
+          keychain="$RUNNER_TEMP/totp-test.keychain-db"
+          security create-keychain -p ci-test-only "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p ci-test-only "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+          cargo test --locked --features native-test --target ${{ matrix.target }} --test native --test native_cli -- --ignored --test-threads=1
+      - name: Remove macOS test keychain
+        if: always() && runner.os == 'macOS'
+        run: security delete-keychain "$RUNNER_TEMP/totp-test.keychain-db" || true
+      - name: Linux isolated Secret Service
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dbus-x11 gnome-keyring
+          export XDG_DATA_HOME="$(mktemp -d)"
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          chmod 700 "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR"
+          dbus-run-session -- bash -euc '
+            printf "ci-test-only\n" | gnome-keyring-daemon --unlock --components=secrets
+            cargo test --locked --features native-test --target x86_64-unknown-linux-gnu --test native --test native_cli -- --ignored --test-threads=1
+          '
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Release binary smoke test
+        run: |
+          binary="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          "$binary" --version
+          "$binary" --data-dir "$RUNNER_TEMP/totp-empty" list --json
+          "$binary" --data-dir "$RUNNER_TEMP/totp-empty" doctor
+      - uses: actions/upload-artifact@v7
+        with:
+          name: totp-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - run: cargo test --locked
