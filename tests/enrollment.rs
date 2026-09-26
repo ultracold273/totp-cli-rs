@@ -58,6 +58,48 @@ fn defaults_unicode_and_redacted_debug() {
 }
 
 #[test]
+fn issuer_parameter_takes_precedence_over_label_prefix() {
+    let enrollment = parse_enrollment(&format!(
+        "otpauth://totp/Example:alice%2Bwork?secret={SECRET}&issuer=example.com&algorithm=SHA256&digits=8&period=60"
+    ))
+    .unwrap();
+    assert_eq!(enrollment.account, "alice+work");
+    assert_eq!(enrollment.issuer, "example.com");
+    assert_eq!(enrollment.secret(), SECRET);
+    assert_eq!(
+        (enrollment.algorithm, enrollment.digits, enrollment.period),
+        (Algorithm::Sha256, 8, 60)
+    );
+    let expected = Enrollment::new(SECRET, "alice+work", "", Algorithm::Sha256, 8, 60).unwrap();
+    assert_eq!(
+        enrollment.code_at(59.0).unwrap(),
+        expected.code_at(59.0).unwrap()
+    );
+}
+
+#[test]
+fn issuer_uses_label_prefix_when_parameter_is_missing_or_blank() {
+    for suffix in ["", "&issuer=", "&issuer=%20"] {
+        let enrollment = parse_enrollment(&format!(
+            "otpauth://totp/Acme:alice?secret={SECRET}{suffix}"
+        ))
+        .unwrap();
+        assert_eq!(enrollment.issuer, "Acme");
+        assert_eq!(enrollment.account, "alice");
+    }
+}
+
+#[test]
+fn issuer_does_not_require_a_label_prefix() {
+    for (suffix, expected) in [("&issuer=example.com", "example.com"), ("", "")] {
+        let enrollment =
+            parse_enrollment(&format!("otpauth://totp/alice?secret={SECRET}{suffix}")).unwrap();
+        assert_eq!(enrollment.issuer, expected);
+        assert_eq!(enrollment.account, "alice");
+    }
+}
+
+#[test]
 fn time_boundaries_and_short_valid_secrets() {
     let enrollment = Enrollment::new("MY======", "work", "", Algorithm::Sha1, 6, 60).unwrap();
     assert_eq!(enrollment.secret(), "MY");
@@ -118,7 +160,6 @@ fn invalid_uri_is_rejected_without_echoing() {
         "otpauth://totp/work?secret=SECRET_MARKER&period=86401",
         "otpauth://totp/work?secret=SECRET_MARKER&period=+30",
         "otpauth://totp/work?secret=SECRET_MARKER&algorithm=MD5",
-        "otpauth://totp/company:work?secret=SECRET_MARKER&issuer=other",
         "otpauth://totp/work%ZZ?secret=SECRET_MARKER",
         "otpauth://totp/work%FF?secret=SECRET_MARKER",
         "otpauth://totp/work%0A?secret=SECRET_MARKER",
@@ -139,12 +180,17 @@ fn invalid_uri_is_rejected_without_echoing() {
 }
 
 #[test]
-fn explicit_issuer_and_label_components_are_unambiguous() {
+fn invalid_issuer_and_label_components_are_rejected() {
     for label_and_query in [
-        "Acme:alice?secret=MY&issuer=",
-        "Acme:alice?secret=MY&issuer=%20",
         "Acme:alice:extra?secret=MY",
+        "Acme:alice:extra?secret=MY&issuer=other",
+        "Acme%00:alice?secret=MY&issuer=other",
+        "Acme%ZZ:alice?secret=MY&issuer=other",
+        "Acme:?secret=MY&issuer=other",
         "alice?secret=MY&issuer=Acme%3AOps",
+        "Acme:alice?secret=MY&issuer=%00",
+        "Acme:alice?secret=MY&issuer=other&issuer=another",
+        "Acme:alice?secret=MY&issuer=other&issuer=other",
     ] {
         assert!(parse_enrollment(&format!("otpauth://totp/{label_and_query}")).is_err());
     }
@@ -170,12 +216,6 @@ fn rejects_valid_secret_with_invalid_options() {
             "accepted {suffix}"
         );
     }
-    assert!(
-        parse_enrollment(&format!(
-            "otpauth://totp/prefix:work?secret={SECRET}&issuer=other"
-        ))
-        .is_err()
-    );
     assert!(
         parse_enrollment(&format!(
             "otpauth://totp/{}?secret={SECRET}",

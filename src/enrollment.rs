@@ -225,12 +225,9 @@ pub fn parse_enrollment(uri: &str) -> Result<Enrollment> {
     let mut issuer = visible_text(option("issuer", ""), true)?;
     let account = if let Some((prefix, account)) = label.split_once(':') {
         let prefix = visible_text(prefix, false)?;
-        if options.contains_key("issuer") && issuer != prefix {
-            return Err(AppError::new(
-                "The enrollment issuer and account-label prefix do not match.",
-            ));
+        if issuer.is_empty() {
+            issuer = prefix;
         }
-        issuer = prefix;
         visible_text(account, false)?
     } else {
         visible_text(&label, false)?
