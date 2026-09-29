@@ -1,8 +1,9 @@
 use crate::{
     enrollment::Enrollment,
     error::{AppError, Result},
+    password,
     qr::read_enrollment,
-    store::{Store, default_directory},
+    store::{PasswordGeneration, Store, default_directory},
     vault::{NativeVault, Vault},
 };
 use clap::{Parser, Subcommand, error::ErrorKind};
@@ -28,7 +29,7 @@ const VERSION: &str = if cfg!(feature = "native-test") {
     name = "totp",
     bin_name = "totp",
     version = VERSION,
-    about = "Offline TOTP with native OS credential storage"
+    about = "Offline TOTP and generated passwords with native OS credential storage"
 )]
 struct Arguments {
     #[arg(
@@ -50,6 +51,12 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         qr: PathBuf,
     },
+    #[command(about = "Attach TOTP to an existing account without replacing any credentials")]
+    Enroll {
+        name: String,
+        #[arg(long, value_name = "PATH")]
+        qr: PathBuf,
+    },
     #[command(about = "List metadata without reading account secrets")]
     List {
         #[arg(long)]
@@ -61,10 +68,53 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
-    #[command(about = "Remove a local credential and its metadata")]
+    #[command(about = "Generate, display, or remove locally stored passwords")]
+    Password {
+        #[command(subcommand)]
+        command: PasswordCommand,
+    },
+    #[command(about = "Remove an account and all its local credentials")]
     Remove { name: String },
     #[command(about = "Show platform, selected backend and metadata location")]
     Doctor,
+}
+
+#[derive(Subcommand)]
+enum PasswordCommand {
+    #[command(
+        about = "Generate and save an alphanumeric password without displaying it",
+        long_about = "Generate and save a password containing at least one uppercase letter, one lowercase letter, and one digit. Creates a password-only account for a new alias, or keeps the existing account's TOTP enrollment. The password is not displayed; use 'totp password show NAME' to reveal it."
+    )]
+    Generate {
+        name: String,
+        #[arg(
+            long,
+            default_value_t = password::DEFAULT_LENGTH,
+            value_parser = parse_password_length,
+            help = "Password length, from 12 to 1280 characters"
+        )]
+        length: usize,
+        #[arg(
+            long,
+            help = "Replace an existing password, or finish its pending cleanup on retry"
+        )]
+        replace: bool,
+    },
+    #[command(
+        about = "Print the stored password in plaintext",
+        long_about = "Print the stored password and a newline to stdout. Terminal logging and output redirection can capture the password."
+    )]
+    Show { name: String },
+    #[command(about = "Remove only the password; keep the account and any TOTP enrollment")]
+    Remove { name: String },
+}
+
+fn parse_password_length(value: &str) -> Result<usize> {
+    let length = value
+        .parse()
+        .map_err(|_| AppError::new("Password length must be a whole number."))?;
+    password::validate_length(length)?;
+    Ok(length)
 }
 
 pub fn main_entry() -> u8 {
@@ -135,25 +185,52 @@ fn run<V: Vault>(
             )
             .map_err(|_| output_error())?;
         }
+        Command::Enroll { name, qr } => {
+            crate::store::validate_alias(&name)?;
+            let enrollment = read_enrollment(&qr)?;
+            store.enroll(&name, &enrollment)?;
+            writeln!(
+                output,
+                "TOTP enrollment attached. Existing passwords and website settings are unchanged."
+            )
+            .map_err(|_| output_error())?;
+        }
         Command::List { json } => {
             let accounts = store.list()?;
             if json {
-                serde_json::to_writer_pretty(&mut *output, &accounts)
+                let summaries: Vec<_> = accounts.iter().map(|account| account.summary()).collect();
+                serde_json::to_writer_pretty(&mut *output, &summaries)
                     .map_err(|_| output_error())?;
                 writeln!(output).map_err(|_| output_error())?;
             } else {
                 for account in accounts {
-                    writeln!(
-                        output,
-                        "{}\t{}\t{}\t{} {} digits {}s",
-                        account.alias,
-                        account.issuer,
-                        account.account,
-                        account.algorithm,
-                        account.digits,
-                        account.period
-                    )
-                    .map_err(|_| output_error())?;
+                    if let Some(totp) = &account.totp {
+                        write!(
+                            output,
+                            "{}\t{}\t{}\t{} {} digits {}s",
+                            account.alias,
+                            totp.issuer,
+                            totp.account,
+                            totp.algorithm,
+                            totp.digits,
+                            totp.period
+                        )
+                        .map_err(|_| output_error())?;
+                    } else {
+                        write!(output, "{}\tno TOTP", account.alias).map_err(|_| output_error())?;
+                    }
+                    let status = if account.password_id.is_some() {
+                        "yes"
+                    } else {
+                        "no"
+                    };
+                    let cleanup = if account.pending_password_deletions.is_empty() {
+                        ""
+                    } else {
+                        " (cleanup pending)"
+                    };
+                    writeln!(output, "\tpassword: {status}{cleanup}")
+                        .map_err(|_| output_error())?;
                 }
             }
         }
@@ -176,18 +253,48 @@ fn run<V: Vault>(
             }
             writeln!(output, "{}", enrollment.code_at(now()?)?.0).map_err(|_| output_error())?;
         }
+        Command::Password { command } => match command {
+            PasswordCommand::Generate {
+                name,
+                length,
+                replace,
+            } => {
+                let message = match store.generate_password(&name, length, replace)? {
+                    PasswordGeneration::Generated => {
+                        "Password generated and saved. Use 'totp password show NAME' to display it. Website passwords are unchanged."
+                    }
+                    PasswordGeneration::CleanupCompleted => {
+                        "Previous password change cleanup completed. No new password was generated."
+                    }
+                };
+                writeln!(output, "{message}").map_err(|_| output_error())?;
+            }
+            PasswordCommand::Show { name } => {
+                let password = store.get_password(&name)?;
+                writeln!(output, "{}", password.as_str()).map_err(|_| output_error())?;
+            }
+            PasswordCommand::Remove { name } => {
+                store.remove_password(&name)?;
+                writeln!(output, "Local password removed. Account metadata, TOTP enrollment, and website passwords are unchanged.")
+                    .map_err(|_| output_error())?;
+            }
+        },
         Command::Remove { name } => {
             store.remove(&name)?;
             writeln!(
                 output,
-                "Local account removed. Website two-factor settings are unchanged."
+                "Local account and credentials removed. Website passwords and two-factor settings are unchanged."
             )
             .map_err(|_| output_error())?;
         }
         Command::Doctor => {
-            let count = store.list()?.len();
-            writeln!(output, "Platform: {}\nSelected backend: {}\nCredential availability: not tested (no read/write probe)\nIndex: {}\nAccounts: {}",
-                std::env::consts::OS, NativeVault::label(), store.directory().join("accounts.json").display(), count).map_err(|_| output_error())?;
+            let accounts = store.list()?;
+            let pending: usize = accounts
+                .iter()
+                .map(|account| account.pending_password_deletions.len())
+                .sum();
+            writeln!(output, "Platform: {}\nSelected backend: {}\nCredential availability: not tested (no read/write probe)\nIndex: {}\nAccounts: {}\nPending password credential deletions: {}",
+                std::env::consts::OS, NativeVault::label(), store.directory().join("accounts.json").display(), accounts.len(), pending).map_err(|_| output_error())?;
         }
     }
     output.flush().map_err(|_| output_error())?;

@@ -16,7 +16,16 @@ fn help_and_version_do_not_open_the_vault() {
     let help = run(&["--help"]);
     assert!(help.status.success());
     let text = String::from_utf8(help.stdout).unwrap();
-    for command in ["add", "list", "code", "remove", "doctor", "--data-dir"] {
+    for command in [
+        "add",
+        "enroll",
+        "list",
+        "code",
+        "password",
+        "remove",
+        "doctor",
+        "--data-dir",
+    ] {
         assert!(text.contains(command));
     }
     let version = run(&["--version"]);
@@ -25,6 +34,115 @@ fn help_and_version_do_not_open_the_vault() {
         String::from_utf8(version.stdout)
             .unwrap()
             .contains(env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn password_help_documents_defaults_and_plaintext_output() {
+    let help = run(&["password", "generate", "--help"]);
+    assert!(help.status.success());
+    let text = String::from_utf8(help.stdout).unwrap();
+    assert!(text.contains("--replace"));
+    assert!(text.contains("--length"));
+    assert!(text.contains("default: 12"));
+    assert!(text.contains("1280"));
+    assert!(text.contains("uppercase"));
+    assert!(text.contains("lowercase"));
+    assert!(text.contains("digit"));
+    let help = run(&["password", "show", "--help"]);
+    assert!(help.status.success());
+    assert!(
+        String::from_utf8(help.stdout)
+            .unwrap()
+            .contains("Terminal logging")
+    );
+}
+
+#[test]
+fn password_arguments_reject_imports_and_invalid_lengths_without_side_effects() {
+    let temporary = tempdir().unwrap();
+    let directory = temporary.path().join("missing");
+    for arguments in [
+        vec!["password", "set", "work", "SECRET_MARKER"],
+        vec!["password", "generate", "work", "--stdin"],
+        vec![
+            "password",
+            "generate",
+            "work",
+            "--password",
+            "SECRET_MARKER",
+        ],
+        vec!["password", "generate", "work", "--length", "11"],
+        vec!["password", "generate", "work", "--length", "1281"],
+        vec!["password", "generate", "work", "--length", "SECRET_MARKER"],
+        vec!["password", "show"],
+    ] {
+        let mut args = vec!["--data-dir", directory.to_str().unwrap()];
+        args.extend(arguments);
+        let result = run(&args);
+        assert_eq!(result.status.code(), Some(2));
+        assert!(result.stdout.is_empty());
+        assert!(
+            !String::from_utf8(result.stderr)
+                .unwrap()
+                .contains("SECRET_MARKER")
+        );
+        assert!(!directory.exists());
+    }
+}
+
+#[test]
+fn missing_password_operations_fail_without_creating_an_index() {
+    let temporary = tempdir().unwrap();
+    let directory = temporary.path().join("missing");
+    for command in ["show", "remove"] {
+        let result = run(&[
+            "--data-dir",
+            directory.to_str().unwrap(),
+            "password",
+            command,
+            "missing",
+        ]);
+        assert_eq!(result.status.code(), Some(1));
+        assert!(result.stdout.is_empty());
+        assert!(
+            String::from_utf8(result.stderr)
+                .unwrap()
+                .contains("not found")
+        );
+        assert!(!directory.exists());
+    }
+}
+
+#[test]
+fn version_two_metadata_lists_without_secret_reads_or_legacy_totp_placeholders() {
+    let temporary = tempdir().unwrap();
+    let metadata = r#"{"format":"local-totp-cli-rs","version":2,"accounts":[{"id":"74946511-8151-43b2-bf2e-83591d7480f2","alias":"work","totp":null,"password_id":"550e8400-e29b-41d4-a716-446655440000","pending_password_deletions":[]}]}"#;
+    fs::write(temporary.path().join("accounts.json"), metadata).unwrap();
+    let listed = run(&[
+        "--data-dir",
+        temporary.path().to_str().unwrap(),
+        "list",
+        "--json",
+    ]);
+    assert!(listed.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(value[0]["has_password"], true);
+    assert_eq!(value[0]["has_totp"], false);
+    assert!(value[0].get("password_id").is_none());
+    assert!(value[0].get("algorithm").is_none());
+    let code = run(&[
+        "--data-dir",
+        temporary.path().to_str().unwrap(),
+        "code",
+        "work",
+    ]);
+    assert_eq!(code.status.code(), Some(1));
+    assert!(code.stdout.is_empty());
+    assert!(String::from_utf8(code.stderr).unwrap().contains("no TOTP"));
+    assert_eq!(
+        fs::read_to_string(temporary.path().join("accounts.json")).unwrap(),
+        metadata
     );
 }
 
@@ -151,4 +269,26 @@ fn invalid_image_and_index_errors_are_sanitized() {
             .unwrap()
             .contains("SECRET_MARKER")
     );
+}
+
+#[test]
+fn failed_password_storage_never_prints_a_password_or_success_message() {
+    let temporary = tempdir().unwrap();
+    let file = temporary.path().join("not-a-directory");
+    fs::write(&file, b"unchanged").unwrap();
+    let result = run(&[
+        "--data-dir",
+        file.to_str().unwrap(),
+        "password",
+        "generate",
+        "work",
+    ]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stdout.is_empty());
+    assert!(
+        String::from_utf8(result.stderr)
+            .unwrap()
+            .contains("directory")
+    );
+    assert_eq!(fs::read(file).unwrap(), b"unchanged");
 }

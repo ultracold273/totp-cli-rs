@@ -15,10 +15,16 @@ pub const SERVICE_PREFIX: &str = if cfg!(feature = "native-test") {
     "local-totp-cli-rs"
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CredentialKind {
+    Totp,
+    Password,
+}
+
 pub trait Vault: Send + Sync {
-    fn get(&self, id: &str) -> Result<Option<Zeroizing<String>>>;
-    fn put(&self, id: &str, secret: &str) -> Result<()>;
-    fn delete(&self, id: &str) -> Result<()>;
+    fn get(&self, kind: CredentialKind, id: &str) -> Result<Option<Zeroizing<String>>>;
+    fn put(&self, kind: CredentialKind, id: &str, secret: &str) -> Result<()>;
+    fn delete(&self, kind: CredentialKind, id: &str) -> Result<()>;
 }
 
 #[derive(Default)]
@@ -46,8 +52,8 @@ impl NativeVault {
 }
 
 impl Vault for NativeVault {
-    fn get(&self, id: &str) -> Result<Option<Zeroizing<String>>> {
-        let service = credential_service(id)?;
+    fn get(&self, kind: CredentialKind, id: &str) -> Result<Option<Zeroizing<String>>> {
+        let service = credential_service(kind, id)?;
         #[cfg(target_os = "windows")]
         let result = windows::get(&service);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -55,8 +61,8 @@ impl Vault for NativeVault {
         read_result(result)
     }
 
-    fn put(&self, id: &str, secret: &str) -> Result<()> {
-        let service = credential_service(id)?;
+    fn put(&self, kind: CredentialKind, id: &str, secret: &str) -> Result<()> {
+        let service = credential_service(kind, id)?;
         #[cfg(target_os = "windows")]
         let result = windows::put(&service, secret);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -64,8 +70,8 @@ impl Vault for NativeVault {
         write_result(result)
     }
 
-    fn delete(&self, id: &str) -> Result<()> {
-        let service = credential_service(id)?;
+    fn delete(&self, kind: CredentialKind, id: &str) -> Result<()> {
+        let service = credential_service(kind, id)?;
         #[cfg(target_os = "windows")]
         let result = windows::delete(&service);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -74,14 +80,17 @@ impl Vault for NativeVault {
     }
 }
 
-fn credential_service(id: &str) -> Result<String> {
+fn credential_service(kind: CredentialKind, id: &str) -> Result<String> {
     let identifier = id.strip_prefix("test-").unwrap_or(id);
     let parsed =
         Uuid::parse_str(identifier).map_err(|_| AppError::new("Invalid credential identifier."))?;
     if parsed.hyphenated().to_string() != identifier {
         return Err(AppError::new("Invalid credential identifier."));
     }
-    Ok(format!("{SERVICE_PREFIX}/{id}"))
+    Ok(match kind {
+        CredentialKind::Totp => format!("{SERVICE_PREFIX}/{id}"),
+        CredentialKind::Password => format!("{SERVICE_PREFIX}/password/{id}"),
+    })
 }
 
 fn read_result(result: keyring::Result<String>) -> Result<Option<Zeroizing<String>>> {
@@ -179,12 +188,20 @@ mod tests {
             "local-totp-cli-rs"
         };
         assert_eq!(
-            credential_service(PUBLIC_ID).unwrap(),
+            credential_service(CredentialKind::Totp, PUBLIC_ID).unwrap(),
             format!("{namespace}/{PUBLIC_ID}")
         );
         assert_eq!(
-            credential_service(&format!("test-{PUBLIC_ID}")).unwrap(),
+            credential_service(CredentialKind::Totp, &format!("test-{PUBLIC_ID}")).unwrap(),
             format!("{namespace}/test-{PUBLIC_ID}")
+        );
+        assert_eq!(
+            credential_service(CredentialKind::Password, PUBLIC_ID).unwrap(),
+            format!("{namespace}/password/{PUBLIC_ID}")
+        );
+        assert_eq!(
+            credential_service(CredentialKind::Password, &format!("test-{PUBLIC_ID}")).unwrap(),
+            format!("{namespace}/password/test-{PUBLIC_ID}")
         );
     }
 
@@ -200,27 +217,32 @@ mod tests {
             "550e8400-e29b-41d4-a716-446655440000\0",
             "urn:uuid:550e8400-e29b-41d4-a716-446655440000",
             "test-test-550e8400-e29b-41d4-a716-446655440000",
+            "password/550e8400-e29b-41d4-a716-446655440000",
             "secret\nbackend failure",
         ] {
-            assert_eq!(
-                credential_service(identifier).unwrap_err().to_string(),
-                "Invalid credential identifier."
-            );
-            assert_eq!(
-                vault.get(identifier).unwrap_err().to_string(),
-                "Invalid credential identifier."
-            );
-            assert_eq!(
-                vault
-                    .put(identifier, PUBLIC_SECRET)
-                    .unwrap_err()
-                    .to_string(),
-                "Invalid credential identifier."
-            );
-            assert_eq!(
-                vault.delete(identifier).unwrap_err().to_string(),
-                "Invalid credential identifier."
-            );
+            for kind in [CredentialKind::Totp, CredentialKind::Password] {
+                assert_eq!(
+                    credential_service(kind, identifier)
+                        .unwrap_err()
+                        .to_string(),
+                    "Invalid credential identifier."
+                );
+                assert_eq!(
+                    vault.get(kind, identifier).unwrap_err().to_string(),
+                    "Invalid credential identifier."
+                );
+                assert_eq!(
+                    vault
+                        .put(kind, identifier, PUBLIC_SECRET)
+                        .unwrap_err()
+                        .to_string(),
+                    "Invalid credential identifier."
+                );
+                assert_eq!(
+                    vault.delete(kind, identifier).unwrap_err().to_string(),
+                    "Invalid credential identifier."
+                );
+            }
         }
     }
 

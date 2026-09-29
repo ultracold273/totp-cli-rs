@@ -42,7 +42,7 @@ jobs:
       - run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
       - run: cargo clippy --locked --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
       - run: cargo test --locked --target ${{ matrix.target }}
-      - run: cargo test --locked --features native-test --target ${{ matrix.target }} --lib --test cli --test store
+      - run: cargo test --locked --features native-test --target ${{ matrix.target }} --lib --test cli --test store --test passwords
       - run: bash scripts/check-dependencies.sh ${{ matrix.target }}
       - name: Windows disposable native credentials
         if: runner.os == 'Windows'

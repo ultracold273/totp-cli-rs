@@ -1,6 +1,7 @@
 use crate::enrollment::{Algorithm, Enrollment, validate_parameters, visible_text};
 use crate::error::{AppError, Result};
-use crate::vault::{SERVICE_PREFIX, Vault};
+use crate::password::{self, Password};
+use crate::vault::{CredentialKind, SERVICE_PREFIX, Vault};
 use icu_casemap::CaseMapper;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -21,10 +22,27 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Document {
+struct Document<AccountType> {
     format: String,
     version: u32,
-    accounts: Vec<Account>,
+    accounts: Vec<AccountType>,
+}
+
+#[derive(Deserialize)]
+struct DocumentVersion {
+    version: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyAccount {
+    id: String,
+    alias: String,
+    account: String,
+    issuer: String,
+    algorithm: Algorithm,
+    digits: usize,
+    period: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,11 +50,62 @@ struct Document {
 pub struct Account {
     pub id: String,
     pub alias: String,
+    pub totp: Option<TotpMetadata>,
+    pub password_id: Option<String>,
+    #[serde(default)]
+    pub pending_password_deletions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TotpMetadata {
     pub account: String,
     pub issuer: String,
     pub algorithm: Algorithm,
     pub digits: usize,
     pub period: u64,
+}
+
+impl From<&Enrollment> for TotpMetadata {
+    fn from(enrollment: &Enrollment) -> Self {
+        Self {
+            account: enrollment.account.clone(),
+            issuer: enrollment.issuer.clone(),
+            algorithm: enrollment.algorithm,
+            digits: enrollment.digits,
+            period: enrollment.period,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct AccountSummary<'a> {
+    id: &'a str,
+    alias: &'a str,
+    #[serde(flatten)]
+    totp: Option<&'a TotpMetadata>,
+    has_totp: bool,
+    has_password: bool,
+    password_cleanup_pending: bool,
+}
+
+impl Account {
+    pub fn summary(&self) -> AccountSummary<'_> {
+        AccountSummary {
+            id: &self.id,
+            alias: &self.alias,
+            totp: self.totp.as_ref(),
+            has_totp: self.totp.is_some(),
+            has_password: self.password_id.is_some(),
+            password_cleanup_pending: !self.pending_password_deletions.is_empty(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PasswordGeneration {
+    Generated,
+    CleanupCompleted,
 }
 
 pub struct Store<V: Vault> {
@@ -75,25 +144,48 @@ impl<V: Vault> Store<V> {
                 "That alias already exists. Nothing was replaced.",
             ));
         }
-        let id = Uuid::new_v4().to_string();
+        let id = new_id()?;
         let record = Account {
             id: id.clone(),
             alias,
-            account: enrollment.account.clone(),
-            issuer: enrollment.issuer.clone(),
-            algorithm: enrollment.algorithm,
-            digits: enrollment.digits,
-            period: enrollment.period,
+            totp: Some(TotpMetadata::from(enrollment)),
+            password_id: None,
+            pending_password_deletions: Vec::new(),
         };
         validate_record(&record)?;
         accounts.push(record);
+        self.save_totp(&accounts, &id, enrollment)
+    }
+
+    pub fn enroll(&self, alias: &str, enrollment: &Enrollment) -> Result<()> {
+        let alias = validate_alias(alias)?;
+        if !self.exists()? {
+            return Err(not_found());
+        }
+        let _lock = self.lock()?;
+        let mut accounts = self.read()?;
+        let position = accounts
+            .iter()
+            .position(|record| folded(&record.alias) == folded(&alias))
+            .ok_or_else(not_found)?;
+        if accounts[position].totp.is_some() {
+            return Err(AppError::new(
+                "This account already has a TOTP enrollment. Nothing was replaced.",
+            ));
+        }
+        accounts[position].totp = Some(TotpMetadata::from(enrollment));
+        validate_record(&accounts[position])?;
+        self.save_totp(&accounts, &accounts[position].id, enrollment)
+    }
+
+    fn save_totp(&self, accounts: &[Account], id: &str, enrollment: &Enrollment) -> Result<()> {
         let result = self
             .vault
-            .put(&id, enrollment.secret())
+            .put(CredentialKind::Totp, id, enrollment.secret())
             .map_err(|_| AppError::new("Could not save the credential to the OS credential store."))
-            .and_then(|()| self.write(&accounts));
+            .and_then(|()| self.write(accounts));
         if let Err(error) = result {
-            if self.vault.delete(&id).is_err() {
+            if self.vault.delete(CredentialKind::Totp, id).is_err() {
                 return Err(AppError::new(format!(
                     "Import failed and credential cleanup failed. Remove the OS credential with ID {id}."
                 )));
@@ -111,17 +203,143 @@ impl<V: Vault> Store<V> {
         let _lock = self.lock()?;
         let accounts = self.read()?;
         let record = find(&accounts, &alias)?;
-        let secret = self.vault.get(&record.id)
+        let totp = record
+            .totp
+            .as_ref()
+            .ok_or_else(|| AppError::new("This account has no TOTP enrollment."))?;
+        let secret = self.vault.get(CredentialKind::Totp, &record.id)
             .map_err(|_| AppError::new("Could not read the credential. Unlock the OS credential store."))?
             .ok_or_else(|| AppError::new("This account's credential is missing. Remove its index entry and import the enrollment again."))?;
         Enrollment::new(
             &secret,
-            &record.account,
-            &record.issuer,
-            record.algorithm,
-            record.digits,
-            record.period,
+            &totp.account,
+            &totp.issuer,
+            totp.algorithm,
+            totp.digits,
+            totp.period,
         )
+    }
+
+    pub fn generate_password(
+        &self,
+        alias: &str,
+        length: usize,
+        replace: bool,
+    ) -> Result<PasswordGeneration> {
+        let alias = validate_alias(alias)?;
+        password::validate_length(length)?;
+        let _lock = self.lock()?;
+        let mut accounts = self.read()?;
+        let position = accounts
+            .iter()
+            .position(|record| folded(&record.alias) == folded(&alias));
+        if let Some(position) = position {
+            if accounts[position].password_id.is_some() && !replace {
+                return Err(AppError::new(
+                    "This account already has a password. Use --replace to generate a replacement.",
+                ));
+            }
+            if !accounts[position].pending_password_deletions.is_empty() {
+                let resume_replacement = accounts[position].password_id.is_some();
+                self.cleanup_passwords(&mut accounts, position)?;
+                if resume_replacement {
+                    // Retrying a committed change must not rotate the password again.
+                    return Ok(PasswordGeneration::CleanupCompleted);
+                }
+            }
+        }
+        let password = password::generate(length)?;
+        let position = match position {
+            Some(position) => position,
+            None => {
+                accounts.push(Account {
+                    id: new_id()?,
+                    alias,
+                    totp: None,
+                    password_id: None,
+                    pending_password_deletions: Vec::new(),
+                });
+                accounts.len() - 1
+            }
+        };
+        let id = new_id()?;
+        if let Some(previous) = accounts[position].password_id.replace(id.clone()) {
+            accounts[position].pending_password_deletions.push(previous);
+        }
+        // Keep the previous credential until the new reference is durably committed.
+        let result = self
+            .vault
+            .put(CredentialKind::Password, &id, password.as_str())
+            .map_err(|_| {
+                AppError::new("Could not save the generated password to the OS credential store.")
+            })
+            .and_then(|()| self.write(&accounts));
+        if let Err(error) = result {
+            if self.vault.delete(CredentialKind::Password, &id).is_err() {
+                return Err(AppError::new(format!(
+                    "Password generation failed and credential cleanup failed. The previous password reference is unchanged. Remove the password credential with ID {id}."
+                )));
+            }
+            return Err(error);
+        }
+        self.cleanup_passwords(&mut accounts, position)?;
+        Ok(PasswordGeneration::Generated)
+    }
+
+    pub fn get_password(&self, alias: &str) -> Result<Password> {
+        let alias = validate_alias(alias)?;
+        if !self.exists()? {
+            return Err(not_found());
+        }
+        let _lock = self.lock()?;
+        let accounts = self.read()?;
+        let record = find(&accounts, &alias)?;
+        let id = record.password_id.as_ref().ok_or_else(no_password)?;
+        let password = self
+            .vault
+            .get(CredentialKind::Password, id)
+            .map_err(|_| AppError::new("Could not read the password. Unlock the OS credential store."))?
+            .ok_or_else(|| {
+                AppError::new(
+                    "This account's password credential is missing. Generate a replacement with --replace.",
+                )
+            })?;
+        Password::from_stored(password)
+    }
+
+    pub fn remove_password(&self, alias: &str) -> Result<()> {
+        let alias = validate_alias(alias)?;
+        if !self.exists()? {
+            return Err(not_found());
+        }
+        let _lock = self.lock()?;
+        let mut accounts = self.read()?;
+        let position = accounts
+            .iter()
+            .position(|record| folded(&record.alias) == folded(&alias))
+            .ok_or_else(not_found)?;
+        if let Some(id) = accounts[position].password_id.take() {
+            accounts[position].pending_password_deletions.push(id);
+            self.write(&accounts)?;
+        } else if accounts[position].pending_password_deletions.is_empty() {
+            return Err(no_password());
+        }
+        self.cleanup_passwords(&mut accounts, position)
+    }
+
+    fn cleanup_passwords(&self, accounts: &mut [Account], position: usize) -> Result<()> {
+        if accounts[position].pending_password_deletions.is_empty() {
+            return Ok(());
+        }
+        let has_password = accounts[position].password_id.is_some();
+        for id in &accounts[position].pending_password_deletions {
+            self.vault
+                .delete(CredentialKind::Password, id)
+                .map_err(|_| password_cleanup_error(has_password))?;
+        }
+        accounts[position].pending_password_deletions.clear();
+        self.write(accounts)
+            .map_err(|_| password_cleanup_error(has_password))
     }
 
     pub fn remove(&self, alias: &str) -> Result<()> {
@@ -131,10 +349,22 @@ impl<V: Vault> Store<V> {
         }
         let _lock = self.lock()?;
         let mut accounts = self.read()?;
-        let id = find(&accounts, &alias)?.id.clone();
-        self.vault.delete(&id).map_err(|_| {
-            AppError::new("Could not remove the credential from the OS credential store.")
-        })?;
+        let record = find(&accounts, &alias)?;
+        for id in record
+            .password_id
+            .iter()
+            .chain(&record.pending_password_deletions)
+        {
+            self.vault.delete(CredentialKind::Password, id).map_err(|_| {
+                AppError::new("Could not remove all account credentials. Some may already be removed. Retry the remove command to finish cleanup.")
+            })?;
+        }
+        if record.totp.is_some() {
+            self.vault.delete(CredentialKind::Totp, &record.id).map_err(|_| {
+                AppError::new("Could not remove all account credentials. Some may already be removed. Retry the remove command to finish cleanup.")
+            })?;
+        }
+        let id = record.id.clone();
         accounts.retain(|account| account.id != id);
         self.write(&accounts).map_err(|_| AppError::new("The credential was removed but its index could not be updated. Retry the remove command to finish cleanup."))
     }
@@ -201,25 +431,67 @@ impl<V: Vault> Store<V> {
         if content.len() as u64 > MAX_INDEX_BYTES {
             return Err(invalid_index());
         }
-        let document: Document = serde_json::from_slice(&content).map_err(|_| invalid_index())?;
-        if document.format != NAMESPACE || document.version != 1 {
-            return Err(invalid_index());
-        }
+        let header: DocumentVersion =
+            serde_json::from_slice(&content).map_err(|_| invalid_index())?;
+        let accounts = match header.version {
+            1 => {
+                let document: Document<LegacyAccount> =
+                    serde_json::from_slice(&content).map_err(|_| invalid_index())?;
+                if document.format != NAMESPACE || document.version != 1 {
+                    return Err(invalid_index());
+                }
+                document
+                    .accounts
+                    .into_iter()
+                    .map(|record| Account {
+                        id: record.id,
+                        alias: record.alias,
+                        totp: Some(TotpMetadata {
+                            account: record.account,
+                            issuer: record.issuer,
+                            algorithm: record.algorithm,
+                            digits: record.digits,
+                            period: record.period,
+                        }),
+                        password_id: None,
+                        pending_password_deletions: Vec::new(),
+                    })
+                    .collect()
+            }
+            2 => {
+                let document: Document<Account> =
+                    serde_json::from_slice(&content).map_err(|_| invalid_index())?;
+                if document.format != NAMESPACE || document.version != 2 {
+                    return Err(invalid_index());
+                }
+                document.accounts
+            }
+            _ => return Err(invalid_index()),
+        };
         let mut aliases = HashSet::new();
         let mut ids = HashSet::new();
-        for record in &document.accounts {
+        for record in &accounts {
             validate_record(record).map_err(|_| invalid_index())?;
             if !aliases.insert(folded(&record.alias)) || !ids.insert(&record.id) {
                 return Err(invalid_index());
             }
+            for id in record
+                .password_id
+                .iter()
+                .chain(&record.pending_password_deletions)
+            {
+                if !canonical_id(id) || !ids.insert(id) {
+                    return Err(invalid_index());
+                }
+            }
         }
-        Ok(document.accounts)
+        Ok(accounts)
     }
 
     fn write(&self, accounts: &[Account]) -> Result<()> {
         let document = Document {
             format: NAMESPACE.to_owned(),
-            version: 1,
+            version: 2,
             accounts: accounts.to_vec(),
         };
         let mut content = serde_json::to_vec_pretty(&document).map_err(|_| write_error())?;
@@ -267,17 +539,32 @@ fn folded(alias: &str) -> String {
 }
 
 fn validate_record(record: &Account) -> Result<()> {
-    if validate_alias(&record.alias)? != record.alias
-        || visible_text(&record.account, false)? != record.account
-        || visible_text(&record.issuer, true)? != record.issuer
-        || Uuid::parse_str(&record.id)
-            .map_err(|_| invalid_index())?
-            .to_string()
-            != record.id
-    {
+    if validate_alias(&record.alias)? != record.alias || !canonical_id(&record.id) {
         return Err(invalid_index());
     }
-    validate_parameters(record.digits, record.period)
+    if let Some(totp) = &record.totp {
+        if visible_text(&totp.account, false)? != totp.account
+            || visible_text(&totp.issuer, true)? != totp.issuer
+        {
+            return Err(invalid_index());
+        }
+        validate_parameters(totp.digits, totp.period)?;
+    }
+    Ok(())
+}
+
+fn canonical_id(id: &str) -> bool {
+    Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
+}
+
+fn new_id() -> Result<String> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).map_err(|_| {
+        AppError::new("Could not obtain secure randomness for a credential identifier.")
+    })?;
+    Ok(uuid::Builder::from_random_bytes(bytes)
+        .into_uuid()
+        .to_string())
 }
 
 fn find<'accounts>(accounts: &'accounts [Account], alias: &str) -> Result<&'accounts Account> {
@@ -289,7 +576,17 @@ fn find<'accounts>(accounts: &'accounts [Account], alias: &str) -> Result<&'acco
 }
 
 fn not_found() -> AppError {
-    AppError::new("Account not found. Import it with 'totp add NAME --qr PATH'.")
+    AppError::new("Account not found. Import a TOTP QR or use 'totp password generate NAME'.")
+}
+fn no_password() -> AppError {
+    AppError::new("This account has no stored password. Use 'totp password generate NAME'.")
+}
+fn password_cleanup_error(has_password: bool) -> AppError {
+    AppError::new(if has_password {
+        "The generated password is saved, but previous credential cleanup is incomplete. Retry 'totp password generate NAME --replace' to finish cleanup without generating another password."
+    } else {
+        "Password removal is pending credential cleanup. Retry 'totp password remove NAME' to finish cleanup."
+    })
 }
 fn directory_error() -> AppError {
     AppError::new("Could not access the account index directory. Check its permissions.")

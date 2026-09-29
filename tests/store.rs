@@ -13,7 +13,7 @@ use totp_cli::{
     enrollment::{Algorithm, Enrollment},
     error::Result,
     store::Store,
-    vault::Vault,
+    vault::{CredentialKind, Vault},
 };
 use zeroize::Zeroizing;
 
@@ -162,7 +162,7 @@ fn corrupt_indices_and_python_format_are_not_overwritten() {
         "SECRET_MARKER",
         "{\"version\":1,\"accounts\":[]}",
         "{\"format\":\"local-totp-cli-rs\",\"version\":1,\"version\":1,\"accounts\":[]}",
-        "{\"format\":\"local-totp-cli-rs\",\"version\":2,\"accounts\":[]}",
+        "{\"format\":\"local-totp-cli-rs\",\"version\":3,\"accounts\":[]}",
         "{\"format\":\"local-totp-cli-rs\",\"version\":1,\"accounts\":[],\"secret\":\"SECRET_MARKER\"}",
     ];
     for content in invalid {
@@ -311,14 +311,14 @@ struct DeleteInterference {
 }
 
 impl Vault for DeleteInterference {
-    fn get(&self, id: &str) -> Result<Option<Zeroizing<String>>> {
-        self.vault.get(id)
+    fn get(&self, kind: CredentialKind, id: &str) -> Result<Option<Zeroizing<String>>> {
+        self.vault.get(kind, id)
     }
-    fn put(&self, id: &str, secret: &str) -> Result<()> {
-        self.vault.put(id, secret)
+    fn put(&self, kind: CredentialKind, id: &str, secret: &str) -> Result<()> {
+        self.vault.put(kind, id, secret)
     }
-    fn delete(&self, id: &str) -> Result<()> {
-        self.vault.delete(id)?;
+    fn delete(&self, kind: CredentialKind, id: &str) -> Result<()> {
+        self.vault.delete(kind, id)?;
         fs::rename(
             self.directory.join("accounts.json"),
             self.directory.join("saved.json"),

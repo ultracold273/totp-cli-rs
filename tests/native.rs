@@ -1,4 +1,4 @@
-use totp_cli::vault::{NativeVault, Vault};
+use totp_cli::vault::{CredentialKind, NativeVault, Vault};
 use uuid::Uuid;
 
 const PUBLIC_SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
@@ -25,7 +25,9 @@ impl DisposableCredential {
 
 impl Drop for DisposableCredential {
     fn drop(&mut self) {
-        let _ = self.vault.delete(&self.id);
+        for kind in [CredentialKind::Totp, CredentialKind::Password] {
+            let _ = self.vault.delete(kind, &self.id);
+        }
     }
 }
 
@@ -36,21 +38,54 @@ fn native_roundtrip_update_and_missing_deletion() {
     let vault = &credential.vault;
     let identifier = &credential.id;
 
-    assert!(vault.get(identifier).unwrap().is_none());
-    vault.delete(identifier).unwrap();
-    vault.put(identifier, PUBLIC_SECRET).unwrap();
+    for kind in [CredentialKind::Totp, CredentialKind::Password] {
+        assert!(vault.get(kind, identifier).unwrap().is_none());
+        vault.delete(kind, identifier).unwrap();
+        vault.put(kind, identifier, PUBLIC_SECRET).unwrap();
+        assert_eq!(
+            vault.get(kind, identifier).unwrap().unwrap().as_str(),
+            PUBLIC_SECRET
+        );
+        vault.put(kind, identifier, PUBLIC_UPDATE).unwrap();
+        assert_eq!(
+            vault.get(kind, identifier).unwrap().unwrap().as_str(),
+            PUBLIC_UPDATE
+        );
+        vault.delete(kind, identifier).unwrap();
+        assert!(vault.get(kind, identifier).unwrap().is_none());
+        vault.delete(kind, identifier).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "uses only disposable entries in the native-test credential namespace"]
+fn native_password_and_totp_entries_are_isolated() {
+    let credential = DisposableCredential::new();
+    let vault = &credential.vault;
+    let id = &credential.id;
+    vault.put(CredentialKind::Totp, id, PUBLIC_SECRET).unwrap();
+    vault
+        .put(CredentialKind::Password, id, "Aa0123456789")
+        .unwrap();
     assert_eq!(
-        vault.get(identifier).unwrap().unwrap().as_str(),
+        vault
+            .get(CredentialKind::Password, id)
+            .unwrap()
+            .unwrap()
+            .as_str(),
+        "Aa0123456789"
+    );
+    vault.delete(CredentialKind::Password, id).unwrap();
+    assert_eq!(
+        vault
+            .get(CredentialKind::Totp, id)
+            .unwrap()
+            .unwrap()
+            .as_str(),
         PUBLIC_SECRET
     );
-    vault.put(identifier, PUBLIC_UPDATE).unwrap();
-    assert_eq!(
-        vault.get(identifier).unwrap().unwrap().as_str(),
-        PUBLIC_UPDATE
-    );
-    vault.delete(identifier).unwrap();
-    assert!(vault.get(identifier).unwrap().is_none());
-    vault.delete(identifier).unwrap();
+    vault.delete(CredentialKind::Totp, id).unwrap();
+    assert!(vault.get(CredentialKind::Totp, id).unwrap().is_none());
 }
 
 #[cfg(target_os = "windows")]
@@ -66,9 +101,13 @@ mod windows {
     struct ReadCredential(NonNull<CREDENTIALW>);
 
     impl ReadCredential {
-        fn read(identifier: &str) -> Self {
+        fn read(kind: CredentialKind, identifier: &str) -> Self {
+            let scope = match kind {
+                CredentialKind::Totp => "",
+                CredentialKind::Password => "password/",
+            };
             let target: Vec<u16> = format!(
-                "totp-secret.{}/{identifier}",
+                "totp-secret.{}/{scope}{identifier}",
                 totp_cli::vault::SERVICE_PREFIX
             )
             .encode_utf16()
@@ -104,14 +143,22 @@ mod windows {
     #[ignore = "inspects only a random disposable Windows credential; requires a user logon session"]
     fn native_windows_persistence_is_local_machine() {
         let credential = DisposableCredential::new();
-        for secret in [PUBLIC_SECRET, PUBLIC_UPDATE] {
-            credential.vault.put(&credential.id, secret).unwrap();
-            let stored = ReadCredential::read(&credential.id);
-            let descriptor = unsafe { stored.0.as_ref() };
-            assert_eq!(descriptor.Type, CRED_TYPE_GENERIC);
-            assert_eq!(descriptor.Persist, CRED_PERSIST_LOCAL_MACHINE);
+        for kind in [CredentialKind::Totp, CredentialKind::Password] {
+            for secret in [PUBLIC_SECRET, PUBLIC_UPDATE] {
+                credential.vault.put(kind, &credential.id, secret).unwrap();
+                let stored = ReadCredential::read(kind, &credential.id);
+                let descriptor = unsafe { stored.0.as_ref() };
+                assert_eq!(descriptor.Type, CRED_TYPE_GENERIC);
+                assert_eq!(descriptor.Persist, CRED_PERSIST_LOCAL_MACHINE);
+            }
+            credential.vault.delete(kind, &credential.id).unwrap();
+            assert!(
+                credential
+                    .vault
+                    .get(kind, &credential.id)
+                    .unwrap()
+                    .is_none()
+            );
         }
-        credential.vault.delete(&credential.id).unwrap();
-        assert!(credential.vault.get(&credential.id).unwrap().is_none());
     }
 }
