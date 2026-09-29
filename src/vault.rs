@@ -328,36 +328,40 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_backend_is_explicit_and_construction_only() {
-        let service = credential_service(PUBLIC_ID).unwrap();
-        with_credential(&service, |credential| {
-            let credential = credential
-                .as_any()
-                .downcast_ref::<keyring::macos::MacCredential>()
-                .unwrap();
-            assert_eq!(credential.domain, keyring::macos::MacKeychainDomain::User);
-            assert_eq!(credential.service, service);
-            assert_eq!(credential.account, "totp-secret");
-            Ok(())
-        })
-        .unwrap();
+        for kind in [CredentialKind::Totp, CredentialKind::Password] {
+            let service = credential_service(kind, PUBLIC_ID).unwrap();
+            with_credential(&service, |credential| {
+                let credential = credential
+                    .as_any()
+                    .downcast_ref::<keyring::macos::MacCredential>()
+                    .unwrap();
+                assert_eq!(credential.domain, keyring::macos::MacKeychainDomain::User);
+                assert_eq!(credential.service, service);
+                assert_eq!(credential.account, "totp-secret");
+                Ok(())
+            })
+            .unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_backend_is_explicit_and_runs_off_the_calling_thread() {
         let calling_thread = std::thread::current().id();
-        let service = credential_service(PUBLIC_ID).unwrap();
-        with_credential(&service, |credential| {
-            assert_ne!(std::thread::current().id(), calling_thread);
-            let credential = credential
-                .as_any()
-                .downcast_ref::<keyring::secret_service::SsCredential>()
-                .unwrap();
-            assert_eq!(credential.attributes["service"], service);
-            assert_eq!(credential.attributes["username"], "totp-secret");
-            assert_eq!(credential.attributes["target"], "default");
-            Ok(())
-        })
-        .unwrap();
+        for kind in [CredentialKind::Totp, CredentialKind::Password] {
+            let service = credential_service(kind, PUBLIC_ID).unwrap();
+            with_credential(&service, |credential| {
+                assert_ne!(std::thread::current().id(), calling_thread);
+                let credential = credential
+                    .as_any()
+                    .downcast_ref::<keyring::secret_service::SsCredential>()
+                    .unwrap();
+                assert_eq!(credential.attributes["service"], service);
+                assert_eq!(credential.attributes["username"], "totp-secret");
+                assert_eq!(credential.attributes["target"], "default");
+                Ok(())
+            })
+            .unwrap();
+        }
     }
 }
